@@ -1,0 +1,136 @@
+name: Release
+
+# Releases are cut by hand: write a changeset (`npx changeset`), merge it, then
+# `gh workflow run release.yml --ref main`. One run versions @e2b/pi, publishes it to npm
+# over OIDC trusted publishing (no token) and pushes the version bump to main. npm trusts
+# this file and the `deployment` environment, which only allows main.
+on:
+  workflow_dispatch: {}
+
+concurrency: release-${{ github.ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Release preflight
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - name: Check the ref
+        # `workflow_dispatch` offers every branch in the picker, and a feature branch
+        # carrying changesets would otherwise publish from that branch.
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::Releases must run on main; this run is on ${REF}."
+          exit 1
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: No local dependencies
+        # A file: or link: dependency would publish a local path that nothing outside
+        # this repo could install.
+        run: |
+          if grep -nE '"(file|link):' package.json; then
+            echo "::error::Local dependency paths found; point them at published versions before releasing."
+            exit 1
+          fi
+
+      - name: Check for pending changesets
+        id: version
+        run: echo "release=$(./.github/scripts/is_release.sh)" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Check
+    needs: preflight
+    if: needs.preflight.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run check
+
+  publish:
+    name: Version and publish
+    needs: [preflight, test]
+    if: needs.preflight.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    # npm's trusted publisher is pinned to this environment, and its deployment branch
+    # policy only allows main.
+    environment: deployment
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        id: app-token
+        with:
+          app-id: ${{ vars.VERSION_BUMPER_APPID }}
+          private-key: ${{ secrets.VERSION_BUMPER_SECRET }}
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - name: Update npm
+        # npm trusted publishing needs npm 11.5.1 or newer.
+        run: |
+          npm install -g npm@^11.6
+          npm --version
+
+      - run: npm ci
+
+      - name: Create new versions
+        run: npm run version
+
+      - name: Commit new versions
+        id: commit
+        # Commit before publishing, because `changeset publish` tags whatever HEAD it
+        # publishes from.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # `add -A`: `changeset version` writes CHANGELOG.md as a new file the first time.
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::error::'changeset version' produced no changes, so there is nothing to publish or tag."
+            exit 1
+          fi
+          git commit -m "[skip ci] Release new version"
+
+      - name: Publish
+        id: release
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
+        with:
+          publish: npm run release
+          createGithubReleases: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push new version
+        # Keep the version bump even after a failed publish, so a rerun cannot reuse a
+        # version npm may already have.
+        if: always() && steps.commit.outcome == 'success' && steps.release.outcome != 'skipped'
+        run: |
+          if ! git push; then
+            git fetch origin "${GITHUB_REF_NAME}"
+            git merge --no-edit FETCH_HEAD
+            git push
+          fi
